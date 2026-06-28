@@ -4,6 +4,12 @@ Speak each built-in test phrase once; that single recording is fanned out
 to every configured phonetic model and every configured language model so
 you can judge quality side by side, with take-to-take variance removed.
 
+Models are loaded and evaluated ONE AT A TIME, never held in memory
+together: all phrases are recorded up front (only the lightweight VAD
+model needed for that), then each model is loaded, run against every
+recording, and freed before the next model loads. Peak memory is the
+size of the single largest model, not the sum of all of them.
+
 Usage:
     python benchmarks/compare_models.py
     python benchmarks/compare_models.py --repeats 3
@@ -16,12 +22,19 @@ list for a quick first pass.
 """
 
 import argparse
+import gc
 import statistics
+import sys
 import time
 
 import torch
 
 from voicekit import LanguageTranslator, MatchingAlgo, PhoneticTranslator, VoiceRecorder
+
+# IPA output (e.g. the "long" mark 'ː') isn't representable in the legacy
+# codepages some Windows consoles default to — replace rather than crash.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 DEFAULT_PHONETIC_MODELS = [
     "facebook/wav2vec2-lv-60-espeak-cv-ft",
@@ -45,30 +58,112 @@ def cuda_mem_mb():
     return torch.cuda.memory_allocated() / 1e6
 
 
-def load_phonetic_models(model_ids):
-    models, stats = {}, []
+def release_gpu_memory():
+    """Force Python's GC and CUDA's allocator to actually reclaim memory.
+
+    Must be called AFTER the caller has dereferenced its model (e.g. `del
+    model` or `model = None`) — a helper that takes `model` as a parameter
+    and does `del model` inside its own frame only drops *that* frame's
+    reference, not the caller's, so the object would stay alive.
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def record_all_phrases(recorder, repeats):
+    """Record every test phrase (x repeats) before any comparison model is loaded."""
+    recordings = []
+    try:
+        for run in range(repeats):
+            if repeats > 1:
+                print(f"\n########## Recording run {run + 1}/{repeats} ##########")
+            for phrase in TEST_PHRASES:
+                ipa_hint = f"  (target IPA: {phrase['target_ipa']})" if phrase["target_ipa"] else ""
+                print(f"\n>>> Say: \"{phrase['text']}\"{ipa_hint}")
+                audio = recorder.record()
+                if audio.size == 0:
+                    print("(nothing heard, skipping this phrase)")
+                    continue
+                recordings.append({
+                    "phrase": phrase,
+                    "audio": audio,
+                    "audio_duration": len(audio) / recorder.sample_rate,
+                    "results": {"phonetic": [], "language": []},
+                })
+    except KeyboardInterrupt:
+        print("\nStopped recording early — evaluating what was captured so far.")
+    return recordings
+
+
+def run_phonetic_models(model_ids, recordings, matcher_ipa, load_stats):
+    """Load each phonetic model in turn, score it against every recording, then free it."""
     for model_id in model_ids:
-        before = cuda_mem_mb()
-        t0 = time.perf_counter()
-        models[model_id] = PhoneticTranslator(model_id=model_id)
-        load_time = time.perf_counter() - t0
-        after = cuda_mem_mb()
-        delta = (after - before) if before is not None else None
-        stats.append((model_id, "phonetic", load_time, delta))
-    return models, stats
+        print(f"\nLoading phonetic model: {model_id} ...")
+        model = None
+        try:
+            before = cuda_mem_mb()
+            t0 = time.perf_counter()
+            model = PhoneticTranslator(model_id=model_id)
+            load_time = time.perf_counter() - t0
+            after = cuda_mem_mb()
+            load_stats.append((model_id, "phonetic", load_time, (after - before) if before is not None else None))
+
+            for rec in recordings:
+                phrase, audio = rec["phrase"], rec["audio"]
+                t0 = time.perf_counter()
+                ipa = model.convert(audio)
+                latency = time.perf_counter() - t0
+                target = phrase["target_ipa"]
+                accuracy = matcher_ipa.score(ipa, target) if target else None
+                completeness = (len(ipa) / len(target) * 100) if target else None
+                rec["results"]["phonetic"].append({
+                    "model": model_id, "output": ipa, "latency": latency,
+                    "accuracy": accuracy, "completeness": completeness,
+                })
+        except Exception as e:
+            print(f"  Skipping {model_id}: {e}")
+        finally:
+            if model is not None:
+                del model
+                release_gpu_memory()
+                print(f"  Unloaded {model_id}.")
 
 
-def load_language_models(model_names):
-    models, stats = {}, []
+def run_language_models(model_names, recordings, matcher_wer, load_stats):
+    """Load each language model in turn, score it against every recording, then free it."""
     for name in model_names:
-        before = cuda_mem_mb()
-        t0 = time.perf_counter()
-        models[name] = LanguageTranslator(model=name)
-        load_time = time.perf_counter() - t0
-        after = cuda_mem_mb()
-        delta = (after - before) if before is not None else None
-        stats.append((name, "language", load_time, delta))
-    return models, stats
+        print(f"\nLoading language model: {name} ...")
+        model = None
+        try:
+            before = cuda_mem_mb()
+            t0 = time.perf_counter()
+            model = LanguageTranslator(model=name)
+            load_time = time.perf_counter() - t0
+            after = cuda_mem_mb()
+            load_stats.append((name, "language", load_time, (after - before) if before is not None else None))
+
+            for rec in recordings:
+                phrase, audio = rec["phrase"], rec["audio"]
+                t0 = time.perf_counter()
+                result = model.convert(audio, lang=phrase["lang"])
+                latency = time.perf_counter() - t0
+                rtf = latency / rec["audio_duration"] if rec["audio_duration"] > 0 else None
+                accuracy = matcher_wer.score(result.text, phrase["text"])
+                ref_words = phrase["text"].split()
+                out_words = result.text.split()
+                completeness = (len(out_words) / len(ref_words) * 100) if ref_words else None
+                rec["results"]["language"].append({
+                    "model": name, "output": result.text, "latency": latency, "rtf": rtf,
+                    "accuracy": accuracy, "completeness": completeness, "confidence": result.confidence,
+                })
+        except Exception as e:
+            print(f"  Skipping {name}: {e}")
+        finally:
+            if model is not None:
+                del model
+                release_gpu_memory()
+                print(f"  Unloaded {name}.")
 
 
 def print_loading_table(stats):
@@ -79,46 +174,6 @@ def print_loading_table(stats):
     for name, kind, load_time, vram_delta in stats:
         vram_str = f"{vram_delta:.0f}" if vram_delta is not None else "n/a"
         print(f"{name:<45} {kind:<10} {load_time:>10.1f} {vram_str:>10}")
-
-
-def evaluate_phrase(phrase, phonetic_models, language_models, matcher_ipa, matcher_wer, recorder):
-    ipa_hint = f"  (target IPA: {phrase['target_ipa']})" if phrase["target_ipa"] else ""
-    print(f"\n>>> Say: \"{phrase['text']}\"{ipa_hint}")
-    audio = recorder.record()
-    if audio.size == 0:
-        print("(nothing heard, skipping this phrase)")
-        return None
-    audio_duration = len(audio) / recorder.sample_rate
-
-    phonetic_rows = []
-    for model_id, model in phonetic_models.items():
-        t0 = time.perf_counter()
-        ipa = model.convert(audio)
-        latency = time.perf_counter() - t0
-        target = phrase["target_ipa"]
-        accuracy = matcher_ipa.score(ipa, target) if target else None
-        completeness = (len(ipa) / len(target) * 100) if target else None
-        phonetic_rows.append({
-            "model": model_id, "output": ipa, "latency": latency,
-            "accuracy": accuracy, "completeness": completeness,
-        })
-
-    language_rows = []
-    for name, model in language_models.items():
-        t0 = time.perf_counter()
-        result = model.convert(audio, lang=phrase["lang"])
-        latency = time.perf_counter() - t0
-        rtf = latency / audio_duration if audio_duration > 0 else None
-        accuracy = matcher_wer.score(result.text, phrase["text"])
-        ref_words = phrase["text"].split()
-        out_words = result.text.split()
-        completeness = (len(out_words) / len(ref_words) * 100) if ref_words else None
-        language_rows.append({
-            "model": name, "output": result.text, "latency": latency, "rtf": rtf,
-            "accuracy": accuracy, "completeness": completeness, "confidence": result.confidence,
-        })
-
-    return {"phonetic": phonetic_rows, "language": language_rows, "audio_duration": audio_duration}
 
 
 def print_phonetic_table(rows):
@@ -220,32 +275,35 @@ def main():
         if args.language_models else DEFAULT_LANGUAGE_MODELS
     )
 
-    print("Loading models (first run downloads anything not already cached)...")
+    print("Recording phrases first (only the lightweight VAD model is loaded for this step)...")
     recorder = VoiceRecorder()
-    phonetic_models, phonetic_load_stats = load_phonetic_models(phonetic_model_ids)
-    language_models, language_load_stats = load_language_models(language_model_names)
-    print_loading_table(phonetic_load_stats + language_load_stats)
+    recordings = record_all_phrases(recorder, args.repeats)
+    del recorder
+    release_gpu_memory()
+
+    if not recordings:
+        print("Nothing was recorded; exiting.")
+        return
 
     matcher_ipa = MatchingAlgo(algorithm="levenshtein")
     matcher_wer = MatchingAlgo(algorithm="word_error_rate")
+    load_stats = []
 
-    all_results = []
-    try:
-        for run in range(args.repeats):
-            if args.repeats > 1:
-                print(f"\n########## Run {run + 1}/{args.repeats} ##########")
-            for phrase in TEST_PHRASES:
-                result = evaluate_phrase(
-                    phrase, phonetic_models, language_models, matcher_ipa, matcher_wer, recorder
-                )
-                if result:
-                    print_phonetic_table(result["phonetic"])
-                    print_language_table(result["language"])
-                all_results.append(result)
-    except KeyboardInterrupt:
-        print("\nStopped early.")
+    print(
+        f"\nEvaluating {len(recordings)} recording(s) against "
+        f"{len(phonetic_model_ids)} phonetic model(s) and {len(language_model_names)} "
+        "language model(s) — one model at a time, to keep memory usage low.\n"
+    )
+    run_phonetic_models(phonetic_model_ids, recordings, matcher_ipa, load_stats)
+    run_language_models(language_model_names, recordings, matcher_wer, load_stats)
 
-    aggregate_and_print(all_results)
+    print_loading_table(load_stats)
+    for rec in recordings:
+        print(f"\nPhrase: \"{rec['phrase']['text']}\"")
+        print_phonetic_table(rec["results"]["phonetic"])
+        print_language_table(rec["results"]["language"])
+
+    aggregate_and_print([rec["results"] for rec in recordings])
 
 
 if __name__ == "__main__":
