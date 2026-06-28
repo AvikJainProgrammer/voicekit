@@ -11,7 +11,7 @@ from difflib import get_close_matches
 
 from rapidfuzz.distance import Levenshtein
 
-ALGORITHMS = ("levenshtein", "phonetic_skeleton", "fuzzy")
+ALGORITHMS = ("levenshtein", "phonetic_skeleton", "fuzzy", "word_error_rate")
 
 
 def to_phonetic_skeleton(text: str) -> str:
@@ -41,10 +41,16 @@ class MatchingAlgo:
         self.algorithm = algorithm
 
     def score(self, a: str, b: str) -> float:
-        """Return a 0-100 normalized similarity score between two strings."""
+        """Return a 0-100 normalized similarity score between two strings.
+
+        For "word_error_rate", this is the word-level complement of WER
+        (100 = no word errors), rather than character-level similarity.
+        """
         a, b = a.lower().strip(), b.lower().strip()
         if self.algorithm == "phonetic_skeleton":
             a, b = to_phonetic_skeleton(a), to_phonetic_skeleton(b)
+        elif self.algorithm == "word_error_rate":
+            a, b = a.split(), b.split()
         return Levenshtein.normalized_similarity(a, b) * 100
 
     def best_match(self, text: str, candidates: list[str], cutoff: float = 0.0) -> str | None:

@@ -46,3 +46,30 @@ def test_best_match_empty_candidates_returns_none():
 def test_unknown_algorithm_raises():
     with pytest.raises(ValueError):
         MatchingAlgo("not-a-real-algo")
+
+
+def test_word_error_rate_identical_sentences_score_100():
+    matcher = MatchingAlgo("word_error_rate")
+    assert matcher.score("hello world", "hello world") == 100.0
+
+
+def test_word_error_rate_single_word_substitution():
+    matcher = MatchingAlgo("word_error_rate")
+    assert matcher.score("the quick brown fox jumps", "the quick brown fox jump") == 80.0
+
+
+def test_word_error_rate_scores_lower_than_levenshtein_for_word_level_errors():
+    # A single word substitution is a big jump at word-level but a small one
+    # character-level (only the last letter differs).
+    wer = MatchingAlgo("word_error_rate")
+    lev = MatchingAlgo("levenshtein")
+    sentence_a = "the quick brown fox jumps"
+    sentence_b = "the quick brown fox jump"
+    assert wer.score(sentence_a, sentence_b) < lev.score(sentence_a, sentence_b)
+
+
+def test_word_error_rate_best_match():
+    matcher = MatchingAlgo("word_error_rate")
+    candidates = ["the quick brown fox jump", "a totally different sentence"]
+    assert matcher.best_match("the quick brown fox jumps", candidates, cutoff=50) == candidates[0]
+    assert matcher.best_match("completely unrelated words here", candidates, cutoff=50) is None
