@@ -50,10 +50,13 @@ for words) on English, German, and Sanskrit (Durga names) test phrases:
 - **Phonetic models: `xlsr-53-espeak-cv-ft` consistently beats
   `lv-60-espeak-cv-ft`.** It won or tied in all 12 head-to-head comparisons
   (10 strict wins), with higher aggregate accuracy (54.9% vs 36.6%) and a
-  tighter spread (±18.6 vs ±12.9). Recommended over the current library
-  default.
-- **`medium` and `large-v3` are statistically tied** on word accuracy and
-  both clearly ahead of `tiny` / `small`, as expected from model size.
+  tighter spread (±18.6 vs ±12.9). **Now `PhoneticTranslator`'s default.**
+- **`medium` and `large-v3` are statistically tied** on word accuracy
+  (32.4% vs 33.0%, well within each other's stdev) and both clearly ahead of
+  `tiny` / `small`, as expected from model size. Since they're tied,
+  `medium` is the more efficient choice — same accuracy at lower latency
+  (0.4s vs 0.6s) and a smaller download. **Now `LanguageTranslator`'s
+  default.**
 - **`distil-large-v3` is competitive on English but unreliable on German** —
   it matched `large-v3` on the English test phrases but scored 0% on German
   in 5 of 6 instances, hallucinating unrelated phrases (e.g. "Guten Tag"

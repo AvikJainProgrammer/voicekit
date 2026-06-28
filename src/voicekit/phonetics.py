@@ -15,7 +15,10 @@ class PhoneticTranslator:
 
     def __init__(
         self,
-        model_id: str = "facebook/wav2vec2-lv-60-espeak-cv-ft",
+        # xlsr-53 beat lv-60 in 10/12 head-to-head comparisons (54.9% vs
+        # 36.6% aggregate accuracy) in benchmarks/compare_models.py — see
+        # README.md "Benchmark findings".
+        model_id: str = "facebook/wav2vec2-xlsr-53-espeak-cv-ft",
         device: str | None = None,
     ):
         self.device = resolve_device(device)
