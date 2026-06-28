@@ -10,6 +10,11 @@ model needed for that), then each model is loaded, run against every
 recording, and freed before the next model loads. Peak memory is the
 size of the single largest model, not the sum of all of them.
 
+Language-model accuracy for `lang`s that render in a non-Latin script
+(e.g. Hindi -> Devanagari) is scored against `target_text_alt` when one
+is provided in TEST_PHRASES, instead of being structurally floored at 0%
+against a Latin-script `text` reference it could never match.
+
 Usage:
     python benchmarks/compare_models.py
     python benchmarks/compare_models.py --repeats 3
@@ -42,13 +47,18 @@ DEFAULT_PHONETIC_MODELS = [
 ]
 DEFAULT_LANGUAGE_MODELS = ["tiny", "small", "medium", "large-v3", "distil-large-v3"]
 
+# target_text_alt: Whisper transcribes Hindi-coded audio in Devanagari script,
+# which can never match a Latin-script `text` reference at the word level —
+# that's a scoring artifact, not a model failure. Where we know the expected
+# native-script rendering, it's scored too (character-level) and the better
+# of the two is kept.
 TEST_PHRASES = [
-    {"lang": "english", "text": "the quick brown fox jumps over the lazy dog", "target_ipa": None},
-    {"lang": "english", "text": "she sells seashells by the seashore", "target_ipa": None},
-    {"lang": "german", "text": "Guten Tag", "target_ipa": "ɡuːtntaːk"},
-    {"lang": "german", "text": "Auf Wiedersehen", "target_ipa": "aʊfviːdɐzeːən"},
-    {"lang": "hindi", "text": "Durgā", "target_ipa": "dʊrɡaː"},
-    {"lang": "hindi", "text": "Durgamā", "target_ipa": "dʊrɡəmaː"},
+    {"lang": "english", "text": "the quick brown fox jumps over the lazy dog", "target_ipa": None, "target_text_alt": None},
+    {"lang": "english", "text": "she sells seashells by the seashore", "target_ipa": None, "target_text_alt": None},
+    {"lang": "german", "text": "Guten Tag", "target_ipa": "ɡuːtntaːk", "target_text_alt": None},
+    {"lang": "german", "text": "Auf Wiedersehen", "target_ipa": "aʊfviːdɐzeːən", "target_text_alt": None},
+    {"lang": "hindi", "text": "Durgā", "target_ipa": "dʊrɡaː", "target_text_alt": "दुर्गा"},
+    {"lang": "hindi", "text": "Durgamā", "target_ipa": "dʊrɡəmaː", "target_text_alt": "दुर्गमा"},
 ]
 
 
@@ -80,7 +90,8 @@ def record_all_phrases(recorder, repeats):
                 print(f"\n########## Recording run {run + 1}/{repeats} ##########")
             for phrase in TEST_PHRASES:
                 ipa_hint = f"  (target IPA: {phrase['target_ipa']})" if phrase["target_ipa"] else ""
-                print(f"\n>>> Say: \"{phrase['text']}\"{ipa_hint}")
+                alt_hint = f"  (native script: {phrase['target_text_alt']})" if phrase.get("target_text_alt") else ""
+                print(f"\n>>> Say: \"{phrase['text']}\"{ipa_hint}{alt_hint}")
                 audio = recorder.record()
                 if audio.size == 0:
                     print("(nothing heard, skipping this phrase)")
@@ -130,7 +141,7 @@ def run_phonetic_models(model_ids, recordings, matcher_ipa, load_stats):
                 print(f"  Unloaded {model_id}.")
 
 
-def run_language_models(model_names, recordings, matcher_wer, load_stats):
+def run_language_models(model_names, recordings, matcher_wer, matcher_char, load_stats):
     """Load each language model in turn, score it against every recording, then free it."""
     for name in model_names:
         print(f"\nLoading language model: {name} ...")
@@ -149,7 +160,15 @@ def run_language_models(model_names, recordings, matcher_wer, load_stats):
                 result = model.convert(audio, lang=phrase["lang"])
                 latency = time.perf_counter() - t0
                 rtf = latency / rec["audio_duration"] if rec["audio_duration"] > 0 else None
+
                 accuracy = matcher_wer.score(result.text, phrase["text"])
+                alt_text = phrase.get("target_text_alt")
+                if alt_text:
+                    # Single transliterated words — character-level
+                    # similarity is far more informative than word-level
+                    # WER would be on a one-word string.
+                    accuracy = max(accuracy, matcher_char.score(result.text, alt_text))
+
                 ref_words = phrase["text"].split()
                 out_words = result.text.split()
                 completeness = (len(out_words) / len(ref_words) * 100) if ref_words else None
@@ -295,7 +314,7 @@ def main():
         "language model(s) — one model at a time, to keep memory usage low.\n"
     )
     run_phonetic_models(phonetic_model_ids, recordings, matcher_ipa, load_stats)
-    run_language_models(language_model_names, recordings, matcher_wer, load_stats)
+    run_language_models(language_model_names, recordings, matcher_wer, matcher_ipa, load_stats)
 
     print_loading_table(load_stats)
     for rec in recordings:

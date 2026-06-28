@@ -7,6 +7,7 @@ blocking primitive.
 
 import queue
 import time
+from collections import deque
 
 import numpy as np
 import sounddevice as sd
@@ -28,6 +29,7 @@ class VoiceRecorder:
         silence_timeout: float = 1.3,
         max_duration: float = 30.0,
         device: str | None = None,
+        pre_roll_windows: int = 2,
     ):
         self.sample_rate = sample_rate
         self.block_size = block_size
@@ -35,6 +37,7 @@ class VoiceRecorder:
         self.silence_timeout = silence_timeout
         self.max_duration = max_duration
         self.device = device
+        self.pre_roll_windows = pre_roll_windows
 
         self._vad_model, _ = torch.hub.load(
             repo_or_dir="snakers4/silero-vad",
@@ -57,6 +60,7 @@ class VoiceRecorder:
             audio_queue.put(indata[:, 0].copy())
 
         buffer: list[np.ndarray] = []
+        pre_roll: deque = deque(maxlen=self.pre_roll_windows)
         vad_buf: list[np.ndarray] = []
         in_speech = False
         last_speech = time.time()
@@ -91,6 +95,13 @@ class VoiceRecorder:
                     prob = self._vad_model(torch.from_numpy(window).float(), self.sample_rate).item()
 
                 if prob >= self.vad_threshold:
+                    if not in_speech:
+                        # Recover the audio that preceded VAD's detection —
+                        # the model takes a window or two to ramp up
+                        # confidence, which otherwise clips the first
+                        # syllable of short words.
+                        buffer.extend(pre_roll)
+                        pre_roll.clear()
                     buffer.append(window)
                     last_speech = time.time()
                     in_speech = True
@@ -98,6 +109,8 @@ class VoiceRecorder:
                     buffer.append(window)
                     if (time.time() - last_speech) > self.silence_timeout:
                         break
+                else:
+                    pre_roll.append(window)
 
         if not buffer:
             return np.zeros(0, dtype=np.float32)
