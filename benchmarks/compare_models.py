@@ -162,11 +162,16 @@ def run_language_models(model_names, recordings, matcher_wer, matcher_char, load
                 rtf = latency / rec["audio_duration"] if rec["audio_duration"] > 0 else None
 
                 accuracy = matcher_wer.score(result.text, phrase["text"])
+                if len(phrase["text"].split()) == 1:
+                    # Word-level WER is binary (0% or 100%) when the
+                    # reference is a single word — there's no second token
+                    # to share partial credit with. Fall back to
+                    # character-level similarity so near-misses (e.g.
+                    # "Surgama." vs "Durgamā") aren't floored at 0%.
+                    accuracy = max(accuracy, matcher_char.score(result.text, phrase["text"]))
                 alt_text = phrase.get("target_text_alt")
                 if alt_text:
-                    # Single transliterated words — character-level
-                    # similarity is far more informative than word-level
-                    # WER would be on a one-word string.
+                    # Same reasoning, against the native-script reference.
                     accuracy = max(accuracy, matcher_char.score(result.text, alt_text))
 
                 ref_words = phrase["text"].split()

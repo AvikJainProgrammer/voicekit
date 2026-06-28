@@ -28,11 +28,12 @@ class LanguageTranslator:
     def __init__(
         self,
         lang: str = "english",
-        # medium and large-v3 were statistically tied on accuracy in
-        # benchmarks/compare_models.py (32.4% vs 33.0%, well within each
-        # other's stdev) but medium is faster and lighter — see README.md
-        # "Benchmark findings".
-        model: str = "medium",
+        # large-v3 has a small but consistent edge over medium in
+        # benchmarks/compare_models.py — 10 head-to-head wins vs medium's 3
+        # (17 ties) across 30 test instances, 51.5% vs 47.8% aggregate. An
+        # earlier, smaller sample (N=18) looked tied, which is why this was
+        # briefly set to "medium" — see README.md "Benchmark findings".
+        model: str = "large-v3",
         device: str | None = None,
         beam_size: int = 5,
         initial_prompt: str | None = None,
